@@ -1,5 +1,6 @@
 /**
  * Etapa 3: Integração Relógios Vetoriais + Produtor/Consumidor
+ * Lógica ajustada para reproduzir exatamente a saída do rvet.c
  * ------------------------------------------------------------------------
  * Compilação: mpicc -o etapa3 etapa3.c -lpthread
  * Execução:   mpiexec -n 3 ./etapa3
@@ -13,41 +14,32 @@
 
 /* --- Configurações --- */
 #define BUFFER_SIZE 5
-#define CLOCK_SIZE 3
+#define TAG_DATA 0
+#define TAG_EXIT 1
 
 /* --- Estruturas de Dados --- */
-
 typedef struct Clock {
     int p[3];
 } Clock;
 
-// Estrutura para a fila de envio (precisa saber o destino)
 typedef struct SendItem {
     Clock clock;
     int dest;
 } SendItem;
 
 /* --- Variáveis Globais (Filas e Sincronização) --- */
-
-// Fila de Recepção (Produtor: Thread Receptora | Consumidor: Thread Central)
 Clock recv_queue[BUFFER_SIZE];
-int recv_count = 0;
-int recv_in = 0;
-int recv_out = 0;
+int recv_count = 0, recv_in = 0, recv_out = 0;
 pthread_mutex_t mutex_recv;
 pthread_cond_t cond_recv_full;
 pthread_cond_t cond_recv_empty;
 
-// Fila de Envio (Produtor: Thread Central | Consumidor: Thread Emissora)
 SendItem send_queue[BUFFER_SIZE];
-int send_count = 0;
-int send_in = 0;
-int send_out = 0;
+int send_count = 0, send_in = 0, send_out = 0;
 pthread_mutex_t mutex_send;
 pthread_cond_t cond_send_full;
 pthread_cond_t cond_send_empty;
 
-// Flag para encerrar as threads auxiliares ao final
 volatile int running = 1;
 
 /* --- Funções Auxiliares --- */
@@ -55,7 +47,7 @@ volatile int running = 1;
 void PrintClock(const char *acao, Clock *clock) {
     int pid;
     MPI_Comm_rank(MPI_COMM_WORLD, &pid);
-    printf("[P%d] %s -> Clock = (%d, %d, %d)\n",
+    printf("[Atualizado por P%d] %s -> Clock = (%d,%d,%d)\n",
            pid, acao, clock->p[0], clock->p[1], clock->p[2]);
 }
 
@@ -69,7 +61,7 @@ void MergeClocks(Clock *local, Clock *remote) {
 
 /* --- Threads Auxiliares --- */
 
-// Thread Emissora: Consome da send_queue -> Envia via MPI
+// Thread Emissora: Consome da Fila -> Envia via MPI
 void* sender_thread_func(void* args) {
     while (running) {
         SendItem item;
@@ -79,7 +71,7 @@ void* sender_thread_func(void* args) {
             pthread_cond_wait(&cond_send_empty, &mutex_send);
         }
 
-        if (!running) { // Saída limpa
+        if (!running && send_count == 0) {
             pthread_mutex_unlock(&mutex_send);
             break;
         }
@@ -92,27 +84,26 @@ void* sender_thread_func(void* args) {
         pthread_mutex_unlock(&mutex_send);
 
         // Envia efetivamente via MPI
-        MPI_Send(item.clock.p, 3, MPI_INT, item.dest, 0, MPI_COMM_WORLD);
+        MPI_Send(item.clock.p, 3, MPI_INT, item.dest, TAG_DATA, MPI_COMM_WORLD);
     }
     return NULL;
 }
 
-// Thread Receptora: Recebe via MPI -> Produz na recv_queue
+// Thread Receptora: Recebe via MPI -> Produz na Fila
 void* receiver_thread_func(void* args) {
-    int pid;
-    MPI_Comm_rank(MPI_COMM_WORLD, &pid);
-
     while (running) {
         Clock received_clock;
         MPI_Status status;
         
-        // Bloqueia esperando mensagem de QUALQUER origem (MPI_ANY_SOURCE)
-        // Nota: Não colocamos mutex aqui para não travar o processo todo
-        int mpi_ret = MPI_Recv(received_clock.p, 3, MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
+        // Bloqueia no MPI esperando qualquer mensagem
+        MPI_Recv(received_clock.p, 3, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
         
-        if (mpi_ret != MPI_SUCCESS || !running) break;
+        // Protocolo de Saída: Se receber a tag de exit, encerra
+        if (status.MPI_TAG == TAG_EXIT) {
+            running = 0;
+            break; 
+        }
 
-        // Entra na Seção Crítica para colocar na fila
         pthread_mutex_lock(&mutex_recv);
         while (recv_count == BUFFER_SIZE && running) {
             pthread_cond_wait(&cond_recv_full, &mutex_recv);
@@ -140,23 +131,22 @@ void Event(Clock *clock) {
     MPI_Comm_rank(MPI_COMM_WORLD, &pid);
     
     clock->p[pid]++;
-    PrintClock("Evento Interno", clock);
+    PrintClock("Evento interno", clock);
 }
 
-// Send: Coloca na fila de envio
 void Send(int dest, Clock *clock) {
     int pid;
     MPI_Comm_rank(MPI_COMM_WORLD, &pid);
 
-    // 1. Incrementar clock local
+    // 1. Incrementar clock local ANTES de colocar na fila (conforme seu código base)
     clock->p[pid]++;
 
-    // 2. Preparar item para envio
+    // 2. Preparar item
     SendItem item;
-    item.clock = *clock; // Copia o estado atual
+    item.clock = *clock;
     item.dest = dest;
 
-    // 3. Produzir na fila de envio
+    // 3. Colocar na fila de envio
     pthread_mutex_lock(&mutex_send);
     while (send_count == BUFFER_SIZE) {
         pthread_cond_wait(&cond_send_full, &mutex_send);
@@ -169,19 +159,17 @@ void Send(int dest, Clock *clock) {
     pthread_cond_signal(&cond_send_empty);
     pthread_mutex_unlock(&mutex_send);
 
-    PrintClock("Postou na Fila de Envio", clock);
+    PrintClock("Envio de mensagem", clock);
 }
 
-// Receive: Retira da fila de recepção (não especifica fonte, pega o que tiver)
 void Receive(Clock *clock) {
     int pid;
     MPI_Comm_rank(MPI_COMM_WORLD, &pid);
     Clock remote_clock;
 
-    // 1. Consumir da fila de recepção
+    // 1. Retirar da fila de recepção
     pthread_mutex_lock(&mutex_recv);
     while (recv_count == 0) {
-        // Se a fila estiver vazia, a thread central dorme até a receptora colocar algo
         pthread_cond_wait(&cond_recv_empty, &mutex_recv);
     }
 
@@ -193,67 +181,55 @@ void Receive(Clock *clock) {
     pthread_mutex_unlock(&mutex_recv);
 
     // 2. Merge e Atualização
-    MergeClocks(clock, &remote_clock); // Max(local, remoto)
-    clock->p[pid]++; // Incremento do evento de receive
+    MergeClocks(clock, &remote_clock);
+    clock->p[pid]++;
 
-    PrintClock("Retirou da Fila de Recepção", clock);
+    PrintClock("Recebimento de mensagem", clock);
 }
 
-/* --- Lógica dos Processos (Diagrama) --- */
+/* --- Lógica dos Processos (Copiada do seu gabarito) --- */
 
 void process0() {
     Clock clock = {{0,0,0}};
     PrintClock("Estado inicial", &clock);
-   
-    Event(&clock); 
-    Event(&clock); 
-    Send(1, &clock); 
-    Receive(&clock); // Não especificamos ID, pega da fila
-    Event(&clock); 
-    Send(2, &clock);
-    Event(&clock); 
-    Receive(&clock); 
-    Send(1, &clock);
-    Event(&clock);
+    
+    Event(&clock);      // Evento
+    Send(1, &clock);    // Envia para P1
+    Receive(&clock);    // Espera msg (idealmente de P1)
+    Send(2, &clock);    // Envia para P2
+    Receive(&clock);    // Espera msg (idealmente de P2)
+    Send(1, &clock);    // Envia para P1
+    Event(&clock);      // Evento final
 }
 
 void process1() {
     Clock clock = {{0,0,0}};
     PrintClock("Estado inicial", &clock);
-   
-    Event(&clock); 
-    Send(0, &clock); 
-    Receive(&clock); 
-    Receive(&clock); 
+    
+    Send(0, &clock);    // Envia para P0
+    Receive(&clock);    // Espera P0
+    Receive(&clock);    // Espera P0
 }
 
 void process2() {
     Clock clock = {{0,0,0}};
     PrintClock("Estado inicial", &clock);
-   
-    Event(&clock);
-    Event(&clock); 
-    Send(0, &clock); 
-    Receive(&clock); 
+    
+    Event(&clock);      // Evento
+    Send(0, &clock);    // Envia P0
+    Receive(&clock);    // Espera P0
 }
 
 /* --- Main --- */
 
 int main(int argc, char *argv[]) {
-    int my_rank;
-    int provided;
+    int my_rank, provided;
 
-    // Inicializa MPI com suporte a Threads (MPI_THREAD_MULTIPLE é o ideal, 
-    // mas MPI_THREAD_SERIALIZED serve pois main e sender não acessam MPI simultaneamente em conflito direto,
-    // mas sender e receiver sim. Vamos pedir MULTIPLE por segurança).
+    // Inicializa MPI com suporte a Threads
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    if (provided < MPI_THREAD_MULTIPLE) {
-        printf("Aviso: Suporte a threads MPI insuficiente.\n");
-    }
-
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 
-    // Inicialização de Mutexes e Conditions
+    // Inicialização das Filas
     pthread_mutex_init(&mutex_recv, NULL);
     pthread_cond_init(&cond_recv_full, NULL);
     pthread_cond_init(&cond_recv_empty, NULL);
@@ -262,28 +238,39 @@ int main(int argc, char *argv[]) {
     pthread_cond_init(&cond_send_full, NULL);
     pthread_cond_init(&cond_send_empty, NULL);
 
-    // Criação das threads auxiliares
+    // Criação das threads
     pthread_t t_sender, t_receiver;
     pthread_create(&t_sender, NULL, sender_thread_func, NULL);
     pthread_create(&t_receiver, NULL, receiver_thread_func, NULL);
 
-    // Executa a lógica da Thread Central
+    // Executa a lógica
     if (my_rank == 0) process0();
     else if (my_rank == 1) process1();
     else if (my_rank == 2) process2();
 
-    // Pequeno delay para garantir que mensagens pendentes na fila de saída sejam enviadas
-    sleep(1); 
-    
-    // Encerrando (Abordagem simplificada para laboratório)
-    // Em um sistema real, usaríamos mensagens de controle para parar as threads.
+    // Espera um momento para garantir que os prints saiam (não é estritamente necessário para lógica)
+    sleep(1);
+
+    // --- PROTOCOLO DE ENCERRAMENTO ---
+    // 1. Setar flag de parada
     running = 0;
-    // Acordar threads que podem estar dormindo nas conditions
+
+    // 2. Destravar thread emissora (se estiver vazia)
+    pthread_mutex_lock(&mutex_send);
     pthread_cond_broadcast(&cond_send_empty);
-    pthread_cond_broadcast(&cond_recv_full);
-    
-    // Força bruta para parar MPI_Recv bloqueante se necessário, 
-    // mas MPI_Finalize fará a limpeza.
+    pthread_mutex_unlock(&mutex_send);
+
+    // 3. Destravar thread receptora (Envia msg para SI MESMO para sair do MPI_Recv)
+    int dummy[3];
+    MPI_Send(dummy, 3, MPI_INT, my_rank, TAG_EXIT, MPI_COMM_WORLD);
+
+    // 4. Aguardar threads morrerem
+    pthread_join(t_sender, NULL);
+    pthread_join(t_receiver, NULL);
+
+    // 5. Limpeza
+    pthread_mutex_destroy(&mutex_recv);
+    pthread_mutex_destroy(&mutex_send);
     
     MPI_Finalize();
     return 0;
